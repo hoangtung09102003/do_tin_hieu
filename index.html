@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SIM7100E Monitor - Auto Measurement with Manual AT Command</title>
+  <!-- Chart.js cho biểu đồ -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: sans-serif; background: #f0f0f0; padding: 20px; }
+    .container { max-width: 600px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; }
+    h1 { text-align: center; margin-bottom: 20px; }
+    button { padding: 10px 15px; margin: 5px; border: none; border-radius: 4px; background: #3498db; color: #fff; cursor: pointer; }
+    input[type="text"] { padding: 8px; width: calc(100% - 20px); margin: 5px 0; border-radius: 4px; border: 1px solid #ccc; }
+    #output { margin-top: 10px; background: #ecf0f1; padding: 10px; border-radius: 4px; min-height: 40px; white-space: pre-wrap; }
+    canvas { display: block; margin: auto; }
+    /* CSS cho spinner */
+    .spinner {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #3498db;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      vertical-align: middle;
+      margin-right: 10px;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>SIM7100E Monitor</h1>
+    <button id="connect">Connect COM</button>
+    <button id="toggleAuto">Start Auto AT+CSQ</button>
+    <br>
+    <input type="text" id="atCommand" placeholder="Nhập lệnh AT (ví dụ: AT+CSQ)" />
+    <button id="sendAT">Gửi Lệnh AT</button>
+    <div id="output">
+      <span id="spinner" style="display:none;" class="spinner"></span>
+      <span id="statusText">Trạng thái: Chưa kết nối.</span>
+    </div>
+    <canvas id="signalChart" width="400" height="200"></canvas>
+  </div>
+  
+  <script>
+    let port, reader, writer;
+    let autoInterval = null;
+    let measureCount = 0;
+    let chartLabels = [];
+    let chartDataRSSI = [];
+    const maxPoints = 20;
+    
+    // Khởi tạo biểu đồ sử dụng Chart.js
+    const ctx = document.getElementById('signalChart').getContext('2d');
+    const signalChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: chartLabels,
+        datasets: [{
+          label: 'RSSI',
+          data: chartDataRSSI,
+          backgroundColor: 'rgba(52,152,219,0.5)',
+          borderColor: 'rgba(52,152,219,1)',
+          fill: true,
+          tension: 0.4
+        }]
+      },
+      options: {
+        scales: {
+          y: { beginAtZero: true, suggestedMax: 31 },
+          x: { title: { display: true, text: 'Thời gian' } }
+        }
+      }
+    });
+    
+    function getCurrentTimeLabel() {
+      return new Date().toLocaleTimeString('vi-VN', { hour12: false });
+    }
+    
+    function evaluateSignal(rssi) {
+      if (rssi >= 20 && rssi <= 31) return "Rất tốt";
+      else if (rssi >= 15 && rssi < 20) return "Tốt";
+      else if (rssi >= 10 && rssi < 15) return "Trung bình";
+      else if (rssi >= 1 && rssi < 10) return "Yếu";
+      else if (rssi === 0) return "Rất kém";
+      return "N/A";
+    }
+    
+    function updateChart(rssi) {
+      measureCount++;
+      const timeLabel = getCurrentTimeLabel();
+      chartLabels.push(timeLabel);
+      chartDataRSSI.push(rssi);
+      if (chartLabels.length > maxPoints) {
+        chartLabels.shift();
+        chartDataRSSI.shift();
+      }
+      signalChart.update();
+    }
+    
+    function showSpinner(show) {
+      const spinner = document.getElementById('spinner');
+      spinner.style.display = show ? 'inline-block' : 'none';
+    }
+    
+    function updateStatus(text) {
+      document.getElementById('statusText').textContent = text;
+    }
+    
+    async function connectSerial() {
+      try {
+        updateStatus("Đang kết nối...");
+        showSpinner(true);
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        updateStatus("Connected COM port.");
+        showSpinner(false);
+        writer = port.writable.getWriter();
+        const textDecoder = new TextDecoderStream();
+        port.readable.pipeTo(textDecoder.writable);
+        reader = textDecoder.readable.getReader();
+        readLoop();
+      } catch (error) {
+        updateStatus("Error connecting: " + error);
+        showSpinner(false);
+      }
+    }
+    
+    async function readLoop() {
+      while (true) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) { reader.releaseLock(); break; }
+          if (value) {
+            updateStatus("Received: " + value);
+            let match = value.match(/\+CSQ:\s*(\d+)/);
+            if (match) {
+              const rssi = parseInt(match[1]);
+              updateChart(rssi);
+            }
+          }
+        } catch (error) {
+          updateStatus("Error reading: " + error);
+          break;
+        }
+      }
+    }
+    
+    async function sendCommand(command) {
+      if (port && writer) {
+        try {
+          await writer.write(new TextEncoder().encode(command + "\r\n"));
+          updateStatus("Sent: " + command);
+        } catch (error) {
+          updateStatus("Error sending: " + error);
+        }
+      } else {
+        updateStatus("COM port not connected.");
+      }
+    }
+    
+    document.getElementById('connect').addEventListener('click', connectSerial);
+    
+    document.getElementById('toggleAuto').addEventListener('click', () => {
+      const btn = document.getElementById('toggleAuto');
+      if (!autoInterval) {
+        autoInterval = setInterval(() => {
+          sendCommand("AT+CSQ");
+        }, 5000);
+        btn.textContent = "Stop Auto AT+CSQ";
+      } else {
+        clearInterval(autoInterval);
+        autoInterval = null;
+        btn.textContent = "Start Auto AT+CSQ";
+      }
+    });
+    
+    document.getElementById('sendAT').addEventListener('click', () => {
+      const cmd = document.getElementById('atCommand').value.trim();
+      if(cmd) {
+        sendCommand(cmd);
+      } else {
+        updateStatus("Vui lòng nhập lệnh AT.");
+      }
+    });
+  </script>
+</body>
+</html>
